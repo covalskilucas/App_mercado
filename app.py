@@ -3,6 +3,7 @@ import requests
 from datetime import datetime
 import pandas as pd
 import io
+import time
 # Importações do ReportLab para o PDF
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle
@@ -22,28 +23,28 @@ ANOS = [str(ano) for ano in range(ANO_ATUAL - 1, ANO_ATUAL + 4)]
 # --- FUNÇÕES DE BANCO DE DADOS (FIREBASE) ---
 def carregar_historico_nuvem():
     try:
-        resposta = requests.get(f"{URL_BASE_FIREBASE}historico.json", timeout=10)
+        resposta = requests.get(f"{URL_BASE_FIREBASE}historico.json", timeout=5)
         if resposta.status_code == 200 and resposta.json() is not None:
             return resposta.json()
     except:
-        st.error("Erro ao conectar com o Firebase. Carregando dados locais vazios.")
+        pass
     return {}
 
 def salvar_historico_nuvem(historico):
     try:
-        requests.put(f"{URL_BASE_FIREBASE}historico.json", json=historico, timeout=10)
+        requests.put(f"{URL_BASE_FIREBASE}historico.json", json=historico, timeout=5)
     except:
         st.error("Não foi possível sincronizar os dados na Nuvem.")
 
-# --- INICIALIZAÇÃO DE ESTADO ---
+# --- INICIALIZAÇÃO DE ESTADO E ATUALIZAÇÃO AUTOMÁTICA ---
 if "historico" not in st.session_state:
     st.session_state.historico = carregar_historico_nuvem()
 
 # --- INTERFACE WEB ---
 st.title("🛒 Gerenciador de Compras Compartilhado")
 
-# Painel de Seleção de Data e Sincronização
-col_mes, col_ano, col_sinc = st.columns([2, 1, 2])
+# Painel de Seleção de Data e Controle de Tempo
+col_mes, col_ano, col_sinc, col_auto = st.columns([2, 1, 1, 1])
 with col_mes:
     mes_selecionado = st.selectbox("Mês", MESES, index=datetime.now().month - 1)
 with col_ano:
@@ -62,10 +63,15 @@ if "itens" not in dados_mes:
 
 with col_sinc:
     st.write("") # Alinhamento visual
-    if st.button("🔄 Sincronizar Nuvem", use_container_width=True):
+    if st.button("🔄 Sincronizar Agora", use_container_width=True):
         st.session_state.historico = carregar_historico_nuvem()
-        st.success("Sincronizado com sucesso!")
+        st.success("Sincronizado!")
         st.rerun()
+
+# NOVO: Controle para ativar ou pausar o Auto-Refresh de 5 segundos
+with col_auto:
+    st.write("") # Alinhamento visual
+    auto_refresh = st.checkbox("🔄 Auto-ajuste (5s)", value=True, help="Desmarque se estiver digitando muitos itens seguidos para a tela não atualizar sozinha.")
 
 # --- ORÇAMENTO E RESUMO FINANCEIRO ---
 st.subheader("📊 Painel Financeiro")
@@ -77,7 +83,7 @@ if novo_orcamento != orcamento_atual:
     salvar_historico_nuvem(st.session_state.historico)
     st.rerun()
 
-# Cálculo dos totais baseados nos itens atuais
+# Cálculo dos totais
 total_gasto = sum(item['quantidade'] * item['preco'] for item in dados_mes["itens"])
 saldo = novo_orcamento - total_gasto
 
@@ -93,39 +99,28 @@ else:
 st.subheader("📝 Lista de Compras Atual")
 
 if dados_mes["itens"]:
-    # Converte os dados do Firebase em um DataFrame do Pandas
     df_completo = pd.DataFrame(dados_mes["itens"])
-    
-    # Adiciona ID temporário interno para rastrear as linhas mesmo após filtradas
     df_completo['id_original'] = df_completo.index
-    
-    # Reorganiza e renomeia as colunas para exibição amigável
     df_completo = df_completo[['id_original', 'carrinho', 'categoria', 'nome', 'quantidade', 'preco']]
     df_completo.columns = ['id_original', 'Pego (Carrinho)', 'Categoria', 'Produto', 'Quantidade', 'Preço Unitário (R$)']
     
-    # NOVO: Filtro Dinâmico de Categorias inserido na tela
     categorias_selecionadas = st.multiselect(
         "🔍 Filtrar Lista por Categoria:",
         options=CATEGORIAS,
-        default=CATEGORIAS,
-        help="Remova ou adicione categorias para limpar a visualização abaixo."
+        default=CATEGORIAS
     )
     
-    # Aplica o filtro de categoria selecionado pelo usuário
     df_exibicao = df_completo[df_completo['Categoria'].isin(categorias_selecionadas)]
-    
-    # Calcula dinamicamente o Total por Item para exibição em coluna
     df_exibicao['Total Item (R$)'] = df_exibicao['Quantidade'] * df_exibicao['Preço Unitário (R$)']
 
-    # Renderiza a tabela editável com os filtros aplicados
     tabela_editada = st.data_editor(
         df_exibicao,
         hide_index=True,
         use_container_width=True,
-        num_rows="dynamic", # Permite adicionar e deletar linhas
+        num_rows="dynamic",
         column_config={
-            "id_original": None, # Oculta o ID da tela do usuário
-            "Pego (Carrinho)": st.column_config.CheckboxColumn(help="Marque se já pegou o item"),
+            "id_original": None,
+            "Pego (Carrinho)": st.column_config.CheckboxColumn(),
             "Categoria": st.column_config.SelectboxColumn(options=CATEGORIAS, required=True),
             "Produto": st.column_config.TextColumn(required=True),
             "Quantidade": st.column_config.NumberColumn(min_value=1, step=1, required=True),
@@ -134,12 +129,8 @@ if dados_mes["itens"]:
         }
     )
 
-    # Botão para salvar todas as alterações feitas diretamente nas colunas filtradas
     if st.button("💾 Salvar Alterações da Lista", type="primary", use_container_width=True):
-        # Reconstrói a lista mapeando as edições com base no ID original para não apagar os dados filtrados
         itens_finais = list(dados_mes["itens"])
-        
-        # Lista para rastrear quais IDs foram mantidos ou adicionados
         ids_atualizados_ou_novos = []
 
         for _, row in tabela_editada.iterrows():
@@ -153,29 +144,25 @@ if dados_mes["itens"]:
                 }
                 
                 id_orig = row['id_original']
-                # Se o item já existia, atualiza na sua respectiva posição original
                 if pd.notna(id_orig) and int(id_orig) < len(itens_finais):
                     id_orig = int(id_orig)
                     itens_finais[id_orig] = item_formatado
                     ids_atualizados_ou_novos.append(id_orig)
                 else:
-                    # Se for um item totalmente novo adicionado na tabela, anexa no fim
                     itens_finais.append(item_formatado)
                     ids_atualizados_ou_novos.append(len(itens_finais) - 1)
         
-        # Identifica quais itens dentro das categorias visíveis foram deletados pelo usuário
         ids_deletados = []
         for _, row_original in df_completo[df_completo['Categoria'].isin(categorias_selecionadas)].iterrows():
             if int(row_original['id_original']) not in ids_atualizados_ou_novos:
                 ids_deletados.append(int(row_original['id_original']))
                 
-        # Remove os itens deletados de trás para frente para não quebrar os índices do array
         for id_del in sorted(ids_deletados, reverse=True):
             itens_finais.pop(id_del)
 
         dados_mes["itens"] = itens_finais
         salvar_historico_nuvem(st.session_state.historico)
-        st.success("Lista atualizada e sincronizada com sucesso!")
+        st.success("Lista salva com sucesso!")
         st.rerun()
 
 else:
@@ -195,19 +182,15 @@ def gerar_pdf_bytes():
     estilo_celula = ParagraphStyle('C', parent=estilos['Normal'], fontSize=10)
     
     elementos.append(Paragraph(f"Lista de Compras — {mes_selecionado} / {ano_selecionado}", estilo_titulo))
-    
     dados_tabela = [[Paragraph("Status", estilo_celula), Paragraph("Categoria", estilo_celula), Paragraph("Produto", estilo_celula), Paragraph("Qtd", estilo_celula), Paragraph("Preço Un.", estilo_celula), Paragraph("Total", estilo_celula)]]
     
     for item in dados_mes["itens"]:
         status_pdf = "Pego" if item.get("carrinho") else "Pendente"
         total_item = item["quantidade"] * item["preco"]
         dados_tabela.append([
-            Paragraph(status_pdf, estilo_celula),
-            Paragraph(item["categoria"], estilo_celula),
-            Paragraph(item["nome"], estilo_celula),
-            Paragraph(str(item["quantidade"]), estilo_celula),
-            Paragraph(f"R$ {item['preco']:.2f}", estilo_celula),
-            Paragraph(f"R$ {total_item:.2f}", estilo_celula)
+            Paragraph(status_pdf, estilo_celula), Paragraph(item["categoria"], estilo_celula),
+            Paragraph(item["nome"], estilo_celula), Paragraph(str(item["quantidade"]), estilo_celula),
+            Paragraph(f"R$ {item['preco']:.2f}", estilo_celula), Paragraph(f"R$ {total_item:.2f}", estilo_celula)
         ])
         
     tabela_pdf = Table(dados_tabela)
@@ -225,3 +208,12 @@ if dados_mes["itens"]:
         mime="application/pdf",
         use_container_width=True
     )
+
+# --- LÓGICA DO AUTO-REFRESH (FIM DO SCRIPT) ---
+if auto_refresh:
+    time.sleep(5)
+    # Busca novos dados silenciosamente do Firebase
+    dados_nuvem = carregar_historico_nuvem()
+    if dados_nuvem and dados_nuvem != st.session_state.historico:
+        st.session_state.historico = dados_nuvem
+        st.rerun()
