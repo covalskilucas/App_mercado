@@ -4,10 +4,8 @@ from datetime import datetime
 import pandas as pd
 import io
 import time
-import re
-import cv2
-import numpy as np
-import easyocr  # Nova biblioteca para ler o texto da imagem
+import google.generativeai as genai
+from PIL import Image
 
 # Importações do ReportLab para o PDF
 from reportlab.lib.pagesizes import letter
@@ -20,17 +18,16 @@ st.set_page_config(page_title="Gerenciador de Compras", page_icon="🛒", layout
 
 URL_BASE_FIREBASE = "https://app-compras-mercado-default-rtdb.firebaseio.com/"
 
+# CONFIGURAÇÃO DO GEMINI (Substitua pela sua chave ou configure nos Secrets do Streamlit)
+# Dica: Na produção, use st.secrets["GEMINI_API_KEY"]
+GEMINI_API_KEY = "SUA_CHAVE_API_DO_GEMINI_AQUI" 
+if GEMINI_API_KEY != "SUA_CHAVE_API_DO_GEMINI_AQUI":
+    genai.configure(api_key=GEMINI_API_KEY)
+
 CATEGORIAS = ["Mercearia", "Hortifrúti", "Açougue", "Laticínios / Frios", "Limpeza", "Higiene", "Bebidas", "Padaria", "Outros"]
 MESES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
 ANO_ATUAL = datetime.now().year
 ANOS = [str(ano) for ano in range(ANO_ATUAL - 1, ANO_ATUAL + 4)]
-
-# Inicializa o leitor de OCR (Carrega em cache para ficar rápido)
-@st.cache_resource
-def inicializar_ocr():
-    return easyocr.Reader(['pt']) # Configurado para ler português e números
-
-leitor_ocr = inicializar_ocr()
 
 # --- FUNÇÕES DE BANCO DE DADOS (FIREBASE) ---
 def carregar_historico_nuvem():
@@ -48,7 +45,7 @@ def salvar_historico_nuvem(historico):
     except:
         st.error("Não foi possível sincronizar os dados na Nuvem.")
 
-# --- FUNÇÃO DE SALVAMENTO AUTOMÁTICO ---
+# --- FUNÇÃO DE SALVAMENTO AUTOMÁTICO VIA CALLBACK ---
 def salvar_mudancas_automatico():
     if "tabela_compras" in st.session_state and st.session_state.tabela_compras:
         mudancas = st.session_state.tabela_compras
@@ -57,7 +54,10 @@ def salvar_mudancas_automatico():
         if mudancas.get("edited_rows"):
             for idx_exibicao, colunas_alteradas in mudancas["edited_rows"].items():
                 id_orig = st.session_state.df_atual_exibicao.iloc[int(idx_exibicao)]['id_original']
-                mapeamento = {"Pego (Carrinho)": "carrinho", "Categoria": "categoria", "Produto": "nome", "Quantidade": "quantidade", "Preço Unitário (R$)": "preco"}
+                mapeamento = {
+                    "Pego (Carrinho)": "carrinho", "Categoria": "categoria",
+                    "Produto": "nome", "Quantidade": "quantidade", "Preço Unitário (R$)": "preco"
+                }
                 for col_pt, col_en in mapeamento.items():
                     if col_pt in colunas_alteradas:
                         valor = colunas_alteradas[col_pt]
@@ -77,9 +77,12 @@ def salvar_mudancas_automatico():
                     })
 
         if mudancas.get("deleted_rows"):
-            ids_deletar = [st.session_state.df_atual_exibicao.iloc[int(idx)]['id_original'] for idx in mudancas["deleted_rows"]]
+            ids_deletar = []
+            for idx_exibicao in mudancas["deleted_rows"]:
+                id_orig = st.session_state.df_atual_exibicao.iloc[int(idx_exibicao)]['id_original']
+                ids_deletar.append(int(id_orig))
             for id_del in sorted(ids_deletar, reverse=True):
-                itens_finais.pop(int(id_del))
+                itens_finais.pop(id_del)
 
         st.session_state.historico[chave_periodo]["itens"] = itens_finais
         salvar_historico_nuvem(st.session_state.historico)
@@ -115,6 +118,63 @@ with col_sinc:
         st.success("Dados atualizados da Nuvem!")
         st.rerun()
 
+# --- NOVO: SEÇÃO DE LEITURA COM A CÂMERA ---
+st.subheader("📸 Escanear Preço via Câmera")
+expander_camera = st.expander("Clique aqui para abrir a câmera e escanear produtos/etiquetas")
+
+with expander_camera:
+    if GEMINI_API_KEY == "SUA_CHAVE_API_DO_GEMINI_AQUI":
+        st.warning("Por favor, configure sua GEMINI_API_KEY no código para usar a câmera.")
+    else:
+        foto_capturada = st.camera_input("Aponte para o preço do produto ou etiqueta")
+        
+        if foto_capturada:
+            try:
+                with st.spinner("🤖 IA analisando a imagem e extraindo o preço..."):
+                    # Converte a imagem capturada para o formato que o Gemini aceita
+                    imagem_pil = Image.open(foto_capturada)
+                    
+                    # Inicializa o modelo de visão do Gemini
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    
+                    # Prompt especializado para trazer os dados limpos
+                    prompt = """
+                    Analise esta imagem que contém um produto de mercado ou uma etiqueta de preço.
+                    Extraia o nome do produto e o preço unitário.
+                    Retorne APENAS uma linha no formato exato de texto abaixo, sem explicações:
+                    Nome do Produto;Preco
+                    Exemplo: Arroz 5kg;27.90
+                    Se não encontrar o preço, responda apenas: Desconhecido;0.0
+                    """
+                    
+                    resposta = model.generate_content([prompt, imagem_pil])
+                    resultado_texto = resposta.text.strip()
+                    
+                    # Processa o resultado retornado pela IA
+                    if ";" in resultado_texto:
+                        nome_ia, preco_ia = resultado_texto.split(";")
+                        preco_final = float(preco_ia.replace(",", ".").strip())
+                        nome_final = nome_ia.strip().capitalize()
+                        
+                        if preco_final > 0:
+                            # Adiciona automaticamente o item escaneado na lista atual
+                            novo_item = {
+                                "carrinho": True, # Já marca como no carrinho visto que está escaneando na hora
+                                "categoria": "Mercearia", # Categoria padrão (pode ser alterada na tabela)
+                                "nome": nome_final,
+                                "quantidade": 1,
+                                "preco": preco_final
+                            }
+                            dados_mes["itens"].append(novo_item)
+                            salvar_historico_nuvem(st.session_state.historico)
+                            st.success(f"✅ Adicionado com sucesso: {nome_final} - R$ {preco_final:.2f}")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("Não foi possível identificar um preço válido na imagem. Tente focar melhor.")
+            except Exception as e:
+                st.error(f"Erro ao processar imagem com a IA: {e}")
+
 # --- ORÇAMENTO E RESUMO FINANCEIRO ---
 st.subheader("📊 Painel Financeiro")
 orcamento_atual = dados_mes.get("orcamento", 0.0)
@@ -136,79 +196,9 @@ if saldo < 0:
 else:
     col_sal.metric("Saldo", f"R$ {saldo:.2f}")
 
-# --- NOVO: CAPTURA DE PREÇO PELA CÂMERA DO CELULAR ---
-st.write("---")
-with st.expander("📷 Capturar Preço pela Câmera do Celular", expanded=False):
-    st.write("Tire uma foto nítida e de perto da etiqueta de preço na prateleira do mercado.")
-    
-    # Ativa o componente de câmera nativa do smartphone
-    foto_camera = st.camera_input("Apontar câmera para o preço")
-    
-    if foto_camera is not None:
-        # Converte o arquivo de imagem enviado para o formato OpenCV
-        bytes_imagem = foto_camera.getvalue()
-        cv_img = cv2.imdecode(np.frombuffer(bytes_imagem, np.uint8), cv2.IMREAD_COLOR)
-        
-        # Executa a leitura OCR na imagem capturada
-        with st.spinner("Processando e identificando valores..."):
-            resultados_texto = leitor_ocr.readtext(cv_img, detail=0)
-            
-            # Filtro por Expressão Regular para extrair padrões numéricos de preço (ex: 5,99, 12.50, R$ 4,50)
-            precos_encontrados = []
-            for texto in resultados_texto:
-                # Limpa espaços e caracteres comuns de cifrão
-                texto_limpo = texto.replace("R$", "").replace(" ", "").strip()
-                # Procura padrões de números decimais com vírgula ou ponto
-                padrao = re.findall(r'\d+[\.,]\d{2}', texto_limpo)
-                for preco in padrao:
-                    preco_float = float(preco.replace(",", "."))
-                    if preco_float > 0 and preco_float not in precos_encontrados:
-                        precos_encontrados.append(preco_float)
-            
-            if precos_encontrados:
-                st.success(f"Valores detectados na imagem: {['R$ '+str(p) for p in precos_encontrados]}")
-                
-                # Permite associar o preço lido a um item existente ou criar um novo
-                st.write("**O que deseja fazer com o valor detectado?**")
-                preco_selecionado = st.selectbox("Selecione o preço correto:", precos_encontrados)
-                
-                nome_novo_produto = st.text_input("Nome do Produto (Para adicionar novo ou atualizar):", placeholder="Ex: Arroz 5kg")
-                categoria_novo_produto = st.selectbox("Categoria:", CATEGORIAS)
-                
-                if st.button("➕ Inserir/Atualizar Produto com este Preço", type="primary"):
-                    if nome_novo_produto:
-                        nome_formatado = nome_novo_produto.strip().capitalize()
-                        itens_finais = list(dados_mes["itens"])
-                        
-                        # Verifica se o item já existe para atualizar o preço, senão cria um novo
-                        encontrado = False
-                        for item in itens_finais:
-                            if item["nome"].lower() == nome_formatado.lower():
-                                item["preco"] = preco_selecionado
-                                encontrado = True
-                                break
-                        
-                        if not encontrado:
-                            itens_finais.append({
-                                "carrinho": False,
-                                "categoria": categoria_novo_produto,
-                                "nome": nome_formatado,
-                                "quantidade": 1,
-                                "preco": preco_selecionado
-                            })
-                        
-                        dados_mes["itens"] = itens_finais
-                        salvar_historico_nuvem(st.session_state.historico)
-                        st.toast("Preço salvo com sucesso!", icon="✅")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.warning("Por favor, digite o nome do produto antes de salvar.")
-            else:
-                st.error("Nenhum preço nítido foi detectado. Tente aproximar mais a câmera ou melhorar a iluminação.")
-
 # --- TABELA DE EXIBIÇÃO E EDIÇÃO EM MASSA ---
 st.subheader("📝 Lista de Compras Atual")
+st.caption("⚡ Salvamento Automático Ativo!")
 
 if dados_mes["itens"]:
     df_completo = pd.DataFrame(dados_mes["itens"])
@@ -284,8 +274,9 @@ if dados_mes["itens"]:
         use_container_width=True
     )
 
-# --- AUTO-REFRESH DE LEITURA (2 SEGUNDOS) ---
-time.sleep(2)
+# --- AUTO-REFRESH DE LEITURA (A CADA 3 SEGUNDOS) ---
+# Aumentado levemente para dar tempo de usar a câmera sem concorrência estrita
+time.sleep(3)
 dados_nuvem = carregar_historico_nuvem()
 if dados_nuvem and dados_nuvem != st.session_state.historico:
     st.session_state.historico = dados_nuvem
