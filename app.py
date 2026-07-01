@@ -36,15 +36,70 @@ def salvar_historico_nuvem(historico):
     except:
         st.error("Não foi possível sincronizar os dados na Nuvem.")
 
-# --- INICIALIZAÇÃO DE ESTADO E ATUALIZAÇÃO AUTOMÁTICA ---
+# --- NOVO: FUNÇÃO DE SALVAMENTO AUTOMÁTICO VIA CALLBACK ---
+def salvar_mudancas_automatico():
+    # Esta função roda IMEDIATAMENTE quando qualquer célula da tabela é alterada
+    if "tabela_compras" in st.session_state and st.session_state.tabela_compras:
+        mudancas = st.session_state.tabela_compras
+        itens_finais = list(st.session_state.historico[chave_periodo]["itens"])
+        
+        # 1. Processa linhas editadas
+        if mudancas.get("edited_rows"):
+            for idx_exibicao, colunas_alteradas in mudancas["edited_rows"].items():
+                # Descobre qual era o ID original daquela linha antes do filtro
+                id_orig = st.session_state.df_atual_exibicao.iloc[int(idx_exibicao)]['id_original']
+                
+                # Mapeia os nomes das colunas da tabela de volta para as chaves do Firebase
+                mapeamento = {
+                    "Pego (Carrinho)": "carrinho",
+                    "Categoria": "categoria",
+                    "Produto": "nome",
+                    "Quantidade": "quantidade",
+                    "Preço Unitário (R$)": "preco"
+                }
+                
+                for col_pt, col_en in mapeamento.items():
+                    if col_pt in colunas_alteradas:
+                        valor = colunas_alteradas[col_pt]
+                        if col_en == "nome" and valor:
+                            valor = str(valor).capitalize()
+                        itens_finais[int(id_orig)][col_en] = valor
+
+        # 2. Processa linhas adicionadas
+        if mudancas.get("added_rows"):
+            for linha_nova in mudancas["added_rows"]:
+                if linha_nova.get("Produto"): # Só adiciona se tiver nome
+                    itens_finais.append({
+                        "carrinho": bool(linha_nova.get("Pego (Carrinho)", False)),
+                        "categoria": str(linha_nova.get("Categoria", "Mercearia")),
+                        "nome": str(linha_nova.get("Produto")).capitalize(),
+                        "quantidade": int(linha_nova.get("Quantidade", 1)),
+                        "preco": float(linha_nova.get("Preço Unitário (R$)", 0.0))
+                    })
+
+        # 3. Processa linhas deletadas
+        if mudancas.get("deleted_rows"):
+            ids_deletar = []
+            for idx_exibicao in mudancas["deleted_rows"]:
+                id_orig = st.session_state.df_atual_exibicao.iloc[int(idx_exibicao)]['id_original']
+                ids_deletar.append(int(id_orig))
+            
+            for id_del in sorted(ids_deletar, reverse=True):
+                itens_finais.pop(id_del)
+
+        # Atualiza o estado global e envia para o Firebase de forma transparente
+        st.session_state.historico[chave_periodo]["itens"] = itens_finais
+        salvar_historico_nuvem(st.session_state.historico)
+
+# --- INICIALIZAÇÃO DE ESTADO ---
 if "historico" not in st.session_state:
     st.session_state.historico = carregar_historico_nuvem()
 
 # --- INTERFACE WEB ---
 st.title("🛒 Gerenciador de Compras Compartilhado")
 
-# Painel de Seleção de Data e Controle de Tempo
-col_mes, col_ano, col_sinc, col_auto = st.columns([2, 1, 1, 1])
+# Painel de Seleção de Data
+col_mes, col_ano, col_sinc = st.columns([2, 1, 2])
 with col_mes:
     mes_selecionado = st.selectbox("Mês", MESES, index=datetime.now().month - 1)
 with col_ano:
@@ -62,16 +117,11 @@ if "itens" not in dados_mes:
     dados_mes["itens"] = []
 
 with col_sinc:
-    st.write("") # Alinhamento visual
-    if st.button("🔄 Sincronizar Agora", use_container_width=True):
+    st.write("") 
+    if st.button("🔄 Forçar Sincronização", use_container_width=True):
         st.session_state.historico = carregar_historico_nuvem()
-        st.success("Sincronizado!")
+        st.success("Dados atualizados da Nuvem!")
         st.rerun()
-
-# NOVO: Controle para ativar ou pausar o Auto-Refresh de 5 segundos
-with col_auto:
-    st.write("") # Alinhamento visual
-    auto_refresh = st.checkbox("🔄 Auto-ajuste (5s)", value=True, help="Desmarque se estiver digitando muitos itens seguidos para a tela não atualizar sozinha.")
 
 # --- ORÇAMENTO E RESUMO FINANCEIRO ---
 st.subheader("📊 Painel Financeiro")
@@ -97,6 +147,7 @@ else:
 
 # --- TABELA DE EXIBIÇÃO E EDIÇÃO EM MASSA ---
 st.subheader("📝 Lista de Compras Atual")
+st.caption("⚡ Salvamento Automático Ativo! Qualquer alteração nas colunas é salva imediatamente na Nuvem.")
 
 if dados_mes["itens"]:
     df_completo = pd.DataFrame(dados_mes["itens"])
@@ -110,14 +161,20 @@ if dados_mes["itens"]:
         default=CATEGORIAS
     )
     
-    df_exibicao = df_completo[df_completo['Categoria'].isin(categorias_selecionadas)]
+    df_exibicao = df_completo[df_completo['Categoria'].isin(categorias_selecionadas)].copy()
     df_exibicao['Total Item (R$)'] = df_exibicao['Quantidade'] * df_exibicao['Preço Unitário (R$)']
+    
+    # Salva o DataFrame filtrado no estado para ser usado no cálculo do salvamento automático
+    st.session_state.df_atual_exibicao = df_exibicao
 
-    tabela_editada = st.data_editor(
+    # Renderiza a tabela vinculada com a função automática 'on_change'
+    st.data_editor(
         df_exibicao,
         hide_index=True,
         use_container_width=True,
         num_rows="dynamic",
+        key="tabela_compras",
+        on_change=salvar_mudancas_automatico, # CHAMA A FUNÇÃO AUTOMATICAMENTE A CADA CLIQUE/DIGITAÇÃO
         column_config={
             "id_original": None,
             "Pego (Carrinho)": st.column_config.CheckboxColumn(),
@@ -128,43 +185,6 @@ if dados_mes["itens"]:
             "Total Item (R$)": st.column_config.NumberColumn(format="R$ %.2f", disabled=True)
         }
     )
-
-    if st.button("💾 Salvar Alterações da Lista", type="primary", use_container_width=True):
-        itens_finais = list(dados_mes["itens"])
-        ids_atualizados_ou_novos = []
-
-        for _, row in tabela_editada.iterrows():
-            if pd.notna(row['Produto']) and str(row['Produto']).strip() != "":
-                item_formatado = {
-                    "carrinho": bool(row['Pego (Carrinho)']),
-                    "categoria": str(row['Categoria']),
-                    "nome": str(row['Produto']).capitalize(),
-                    "quantidade": int(row['Quantidade']),
-                    "preco": float(row['Preço Unitário (R$)'])
-                }
-                
-                id_orig = row['id_original']
-                if pd.notna(id_orig) and int(id_orig) < len(itens_finais):
-                    id_orig = int(id_orig)
-                    itens_finais[id_orig] = item_formatado
-                    ids_atualizados_ou_novos.append(id_orig)
-                else:
-                    itens_finais.append(item_formatado)
-                    ids_atualizados_ou_novos.append(len(itens_finais) - 1)
-        
-        ids_deletados = []
-        for _, row_original in df_completo[df_completo['Categoria'].isin(categorias_selecionadas)].iterrows():
-            if int(row_original['id_original']) not in ids_atualizados_ou_novos:
-                ids_deletados.append(int(row_original['id_original']))
-                
-        for id_del in sorted(ids_deletados, reverse=True):
-            itens_finais.pop(id_del)
-
-        dados_mes["itens"] = itens_finais
-        salvar_historico_nuvem(st.session_state.historico)
-        st.success("Lista salva com sucesso!")
-        st.rerun()
-
 else:
     st.info("Nenhum item adicionado para este período.")
     if st.button("➕ Iniciar Nova Lista"):
@@ -209,11 +229,10 @@ if dados_mes["itens"]:
         use_container_width=True
     )
 
-# --- LÓGICA DO AUTO-REFRESH (FIM DO SCRIPT) ---
-if auto_refresh:
-    time.sleep(5)
-    # Busca novos dados silenciosamente do Firebase
-    dados_nuvem = carregar_historico_nuvem()
-    if dados_nuvem and dados_nuvem != st.session_state.historico:
-        st.session_state.historico = dados_nuvem
-        st.rerun()
+# --- AUTO-REFRESH DE LEITURA (A CADA 2 SEGUNDOS) ---
+# Atualiza os dados na sua tela caso OUTRA pessoa mude algo no mercado
+time.sleep(2)
+dados_nuvem = carregar_historico_nuvem()
+if dados_nuvem and dados_nuvem != st.session_state.historico:
+    st.session_state.historico = dados_nuvem
+    st.rerun()
