@@ -38,18 +38,13 @@ def salvar_historico_nuvem(historico):
 
 # --- NOVO: FUNÇÃO DE SALVAMENTO AUTOMÁTICO VIA CALLBACK ---
 def salvar_mudancas_automatico():
-    # Esta função roda IMEDIATAMENTE quando qualquer célula da tabela é alterada
     if "tabela_compras" in st.session_state and st.session_state.tabela_compras:
         mudancas = st.session_state.tabela_compras
         itens_finais = list(st.session_state.historico[chave_periodo]["itens"])
         
-        # 1. Processa linhas editadas
         if mudancas.get("edited_rows"):
             for idx_exibicao, colunas_alteradas in mudancas["edited_rows"].items():
-                # Descobre qual era o ID original daquela linha antes do filtro
                 id_orig = st.session_state.df_atual_exibicao.iloc[int(idx_exibicao)]['id_original']
-                
-                # Mapeia os nomes das colunas da tabela de volta para as chaves do Firebase
                 mapeamento = {
                     "Pego (Carrinho)": "carrinho",
                     "Categoria": "categoria",
@@ -65,10 +60,9 @@ def salvar_mudancas_automatico():
                             valor = str(valor).capitalize()
                         itens_finais[int(id_orig)][col_en] = valor
 
-        # 2. Processa linhas adicionadas
         if mudancas.get("added_rows"):
             for linha_nova in mudancas["added_rows"]:
-                if linha_nova.get("Produto"): # Só adiciona se tiver nome
+                if linha_nova.get("Produto"):
                     itens_finais.append({
                         "carrinho": bool(linha_nova.get("Pego (Carrinho)", False)),
                         "categoria": str(linha_nova.get("Categoria", "Mercearia")),
@@ -77,7 +71,6 @@ def salvar_mudancas_automatico():
                         "preco": float(linha_nova.get("Preço Unitário (R$)", 0.0))
                     })
 
-        # 3. Processa linhas deletadas
         if mudancas.get("deleted_rows"):
             ids_deletar = []
             for idx_exibicao in mudancas["deleted_rows"]:
@@ -87,9 +80,15 @@ def salvar_mudancas_automatico():
             for id_del in sorted(ids_deletar, reverse=True):
                 itens_finais.pop(id_del)
 
-        # Atualiza o estado global e envia para o Firebase de forma transparente
         st.session_state.historico[chave_periodo]["itens"] = itens_finais
         salvar_historico_nuvem(st.session_state.historico)
+
+# --- NOVO: FUNÇÃO PARA APLICAR COR NAS LINHAS PEGAS ---
+def colorir_linhas_pegas(row):
+    # Se a coluna 'Pego (Carrinho)' for True, aplica um fundo verde claro em todas as células daquela linha
+    if row['Pego (Carrinho)']:
+        return ['background-color: #d4edda; color: #155724;'] * len(row)
+    return [''] * len(row)
 
 # --- INICIALIZAÇÃO DE ESTADO ---
 if "historico" not in st.session_state:
@@ -107,7 +106,6 @@ with col_ano:
 
 chave_periodo = f"{MESES.index(mes_selecionado)+1:02d}-{ano_selecionado}"
 
-# Garante que a estrutura exista
 if chave_periodo not in st.session_state.historico:
     st.session_state.historico[chave_periodo] = {"orcamento": 0.0, "itens": []}
     salvar_historico_nuvem(st.session_state.historico)
@@ -120,7 +118,7 @@ with col_sinc:
     st.write("") 
     if st.button("🔄 Forçar Sincronização", use_container_width=True):
         st.session_state.historico = carregar_historico_nuvem()
-        st.success("Dados atualizados da Nuvem!")
+        st.success("Dados updated da Nuvem!")
         st.rerun()
 
 # --- ORÇAMENTO E RESUMO FINANCEIRO ---
@@ -133,7 +131,6 @@ if novo_orcamento != orcamento_atual:
     salvar_historico_nuvem(st.session_state.historico)
     st.rerun()
 
-# Cálculo dos totais
 total_gasto = sum(item['quantidade'] * item['preco'] for item in dados_mes["itens"])
 saldo = novo_orcamento - total_gasto
 
@@ -147,7 +144,7 @@ else:
 
 # --- TABELA DE EXIBIÇÃO E EDIÇÃO EM MASSA ---
 st.subheader("📝 Lista de Compras Atual")
-st.caption("⚡ Salvamento Automático Ativo! Qualquer alteração nas colunas é salva imediatamente na Nuvem.")
+st.caption("⚡ Salvamento Automático Ativo! Itens marcados como pegos ficarão destacados em verde.")
 
 if dados_mes["itens"]:
     df_completo = pd.DataFrame(dados_mes["itens"])
@@ -164,17 +161,19 @@ if dados_mes["itens"]:
     df_exibicao = df_completo[df_completo['Categoria'].isin(categorias_selecionadas)].copy()
     df_exibicao['Total Item (R$)'] = df_exibicao['Quantidade'] * df_exibicao['Preço Unitário (R$)']
     
-    # Salva o DataFrame filtrado no estado para ser usado no cálculo do salvamento automático
     st.session_state.df_atual_exibicao = df_exibicao
 
-    # Renderiza a tabela vinculada com a função automática 'on_change'
+    # NOVO: Aplica a estilização condicional de cores no dataframe antes de mandar para a tela
+    df_estilizado = df_exibicao.style.apply(colorir_linhas_pegas, axis=1)
+
+    # Renderiza o editor de dados passando o objeto estilizado
     st.data_editor(
-        df_exibicao,
+        df_estilizado,
         hide_index=True,
         use_container_width=True,
         num_rows="dynamic",
         key="tabela_compras",
-        on_change=salvar_mudancas_automatico, # CHAMA A FUNÇÃO AUTOMATICAMENTE A CADA CLIQUE/DIGITAÇÃO
+        on_change=salvar_mudancas_automatico,
         column_config={
             "id_original": None,
             "Pego (Carrinho)": st.column_config.CheckboxColumn(),
@@ -230,7 +229,6 @@ if dados_mes["itens"]:
     )
 
 # --- AUTO-REFRESH DE LEITURA (A CADA 2 SEGUNDOS) ---
-# Atualiza os dados na sua tela caso OUTRA pessoa mude algo no mercado
 time.sleep(2)
 dados_nuvem = carregar_historico_nuvem()
 if dados_nuvem and dados_nuvem != st.session_state.historico:
