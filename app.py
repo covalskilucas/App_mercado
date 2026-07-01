@@ -4,6 +4,11 @@ from datetime import datetime
 import pandas as pd
 import io
 import time
+import re
+import cv2
+import numpy as np
+import easyocr  # Nova biblioteca para ler o texto da imagem
+
 # Importações do ReportLab para o PDF
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle
@@ -19,6 +24,13 @@ CATEGORIAS = ["Mercearia", "Hortifrúti", "Açougue", "Laticínios / Frios", "Li
 MESES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
 ANO_ATUAL = datetime.now().year
 ANOS = [str(ano) for ano in range(ANO_ATUAL - 1, ANO_ATUAL + 4)]
+
+# Inicializa o leitor de OCR (Carrega em cache para ficar rápido)
+@st.cache_resource
+def inicializar_ocr():
+    return easyocr.Reader(['pt']) # Configurado para ler português e números
+
+leitor_ocr = inicializar_ocr()
 
 # --- FUNÇÕES DE BANCO DE DADOS (FIREBASE) ---
 def carregar_historico_nuvem():
@@ -36,28 +48,16 @@ def salvar_historico_nuvem(historico):
     except:
         st.error("Não foi possível sincronizar os dados na Nuvem.")
 
-# --- NOVO: FUNÇÃO DE SALVAMENTO AUTOMÁTICO VIA CALLBACK ---
+# --- FUNÇÃO DE SALVAMENTO AUTOMÁTICO ---
 def salvar_mudancas_automatico():
-    # Esta função roda IMEDIATAMENTE quando qualquer célula da tabela é alterada
     if "tabela_compras" in st.session_state and st.session_state.tabela_compras:
         mudancas = st.session_state.tabela_compras
         itens_finais = list(st.session_state.historico[chave_periodo]["itens"])
         
-        # 1. Processa linhas editadas
         if mudancas.get("edited_rows"):
             for idx_exibicao, colunas_alteradas in mudancas["edited_rows"].items():
-                # Descobre qual era o ID original daquela linha antes do filtro
                 id_orig = st.session_state.df_atual_exibicao.iloc[int(idx_exibicao)]['id_original']
-                
-                # Mapeia os nomes das colunas da tabela de volta para as chaves do Firebase
-                mapeamento = {
-                    "Pego (Carrinho)": "carrinho",
-                    "Categoria": "categoria",
-                    "Produto": "nome",
-                    "Quantidade": "quantidade",
-                    "Preço Unitário (R$)": "preco"
-                }
-                
+                mapeamento = {"Pego (Carrinho)": "carrinho", "Categoria": "categoria", "Produto": "nome", "Quantidade": "quantidade", "Preço Unitário (R$)": "preco"}
                 for col_pt, col_en in mapeamento.items():
                     if col_pt in colunas_alteradas:
                         valor = colunas_alteradas[col_pt]
@@ -65,10 +65,9 @@ def salvar_mudancas_automatico():
                             valor = str(valor).capitalize()
                         itens_finais[int(id_orig)][col_en] = valor
 
-        # 2. Processa linhas adicionadas
         if mudancas.get("added_rows"):
             for linha_nova in mudancas["added_rows"]:
-                if linha_nova.get("Produto"): # Só adiciona se tiver nome
+                if linha_nova.get("Produto"):
                     itens_finais.append({
                         "carrinho": bool(linha_nova.get("Pego (Carrinho)", False)),
                         "categoria": str(linha_nova.get("Categoria", "Mercearia")),
@@ -77,17 +76,11 @@ def salvar_mudancas_automatico():
                         "preco": float(linha_nova.get("Preço Unitário (R$)", 0.0))
                     })
 
-        # 3. Processa linhas deletadas
         if mudancas.get("deleted_rows"):
-            ids_deletar = []
-            for idx_exibicao in mudancas["deleted_rows"]:
-                id_orig = st.session_state.df_atual_exibicao.iloc[int(idx_exibicao)]['id_original']
-                ids_deletar.append(int(id_orig))
-            
+            ids_deletar = [st.session_state.df_atual_exibicao.iloc[int(idx)]['id_original'] for idx in mudancas["deleted_rows"]]
             for id_del in sorted(ids_deletar, reverse=True):
-                itens_finais.pop(id_del)
+                itens_finais.pop(int(id_del))
 
-        # Atualiza o estado global e envia para o Firebase de forma transparente
         st.session_state.historico[chave_periodo]["itens"] = itens_finais
         salvar_historico_nuvem(st.session_state.historico)
 
@@ -107,7 +100,6 @@ with col_ano:
 
 chave_periodo = f"{MESES.index(mes_selecionado)+1:02d}-{ano_selecionado}"
 
-# Garante que a estrutura exista
 if chave_periodo not in st.session_state.historico:
     st.session_state.historico[chave_periodo] = {"orcamento": 0.0, "itens": []}
     salvar_historico_nuvem(st.session_state.historico)
@@ -133,7 +125,6 @@ if novo_orcamento != orcamento_atual:
     salvar_historico_nuvem(st.session_state.historico)
     st.rerun()
 
-# Cálculo dos totais
 total_gasto = sum(item['quantidade'] * item['preco'] for item in dados_mes["itens"])
 saldo = novo_orcamento - total_gasto
 
@@ -145,9 +136,79 @@ if saldo < 0:
 else:
     col_sal.metric("Saldo", f"R$ {saldo:.2f}")
 
+# --- NOVO: CAPTURA DE PREÇO PELA CÂMERA DO CELULAR ---
+st.write("---")
+with st.expander("📷 Capturar Preço pela Câmera do Celular", expanded=False):
+    st.write("Tire uma foto nítida e de perto da etiqueta de preço na prateleira do mercado.")
+    
+    # Ativa o componente de câmera nativa do smartphone
+    foto_camera = st.camera_input("Apontar câmera para o preço")
+    
+    if foto_camera is not None:
+        # Converte o arquivo de imagem enviado para o formato OpenCV
+        bytes_imagem = foto_camera.getvalue()
+        cv_img = cv2.imdecode(np.frombuffer(bytes_imagem, np.uint8), cv2.IMREAD_COLOR)
+        
+        # Executa a leitura OCR na imagem capturada
+        with st.spinner("Processando e identificando valores..."):
+            resultados_texto = leitor_ocr.readtext(cv_img, detail=0)
+            
+            # Filtro por Expressão Regular para extrair padrões numéricos de preço (ex: 5,99, 12.50, R$ 4,50)
+            precos_encontrados = []
+            for texto in resultados_texto:
+                # Limpa espaços e caracteres comuns de cifrão
+                texto_limpo = texto.replace("R$", "").replace(" ", "").strip()
+                # Procura padrões de números decimais com vírgula ou ponto
+                padrao = re.findall(r'\d+[\.,]\d{2}', texto_limpo)
+                for preco in padrao:
+                    preco_float = float(preco.replace(",", "."))
+                    if preco_float > 0 and preco_float not in precos_encontrados:
+                        precos_encontrados.append(preco_float)
+            
+            if precos_encontrados:
+                st.success(f"Valores detectados na imagem: {['R$ '+str(p) for p in precos_encontrados]}")
+                
+                # Permite associar o preço lido a um item existente ou criar um novo
+                st.write("**O que deseja fazer com o valor detectado?**")
+                preco_selecionado = st.selectbox("Selecione o preço correto:", precos_encontrados)
+                
+                nome_novo_produto = st.text_input("Nome do Produto (Para adicionar novo ou atualizar):", placeholder="Ex: Arroz 5kg")
+                categoria_novo_produto = st.selectbox("Categoria:", CATEGORIAS)
+                
+                if st.button("➕ Inserir/Atualizar Produto com este Preço", type="primary"):
+                    if nome_novo_produto:
+                        nome_formatado = nome_novo_produto.strip().capitalize()
+                        itens_finais = list(dados_mes["itens"])
+                        
+                        # Verifica se o item já existe para atualizar o preço, senão cria um novo
+                        encontrado = False
+                        for item in itens_finais:
+                            if item["nome"].lower() == nome_formatado.lower():
+                                item["preco"] = preco_selecionado
+                                encontrado = True
+                                break
+                        
+                        if not encontrado:
+                            itens_finais.append({
+                                "carrinho": False,
+                                "categoria": categoria_novo_produto,
+                                "nome": nome_formatado,
+                                "quantidade": 1,
+                                "preco": preco_selecionado
+                            })
+                        
+                        dados_mes["itens"] = itens_finais
+                        salvar_historico_nuvem(st.session_state.historico)
+                        st.toast("Preço salvo com sucesso!", icon="✅")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.warning("Por favor, digite o nome do produto antes de salvar.")
+            else:
+                st.error("Nenhum preço nítido foi detectado. Tente aproximar mais a câmera ou melhorar a iluminação.")
+
 # --- TABELA DE EXIBIÇÃO E EDIÇÃO EM MASSA ---
 st.subheader("📝 Lista de Compras Atual")
-st.caption("⚡ Salvamento Automático Ativo! Qualquer alteração nas colunas é salva imediatamente na Nuvem.")
 
 if dados_mes["itens"]:
     df_completo = pd.DataFrame(dados_mes["itens"])
@@ -155,26 +216,20 @@ if dados_mes["itens"]:
     df_completo = df_completo[['id_original', 'carrinho', 'categoria', 'nome', 'quantidade', 'preco']]
     df_completo.columns = ['id_original', 'Pego (Carrinho)', 'Categoria', 'Produto', 'Quantidade', 'Preço Unitário (R$)']
     
-    categorias_selecionadas = st.multiselect(
-        "🔍 Filtrar Lista por Categoria:",
-        options=CATEGORIAS,
-        default=CATEGORIAS
-    )
+    categorias_selecionadas = st.multiselect("🔍 Filtrar Lista por Categoria:", options=CATEGORIAS, default=CATEGORIAS)
     
     df_exibicao = df_completo[df_completo['Categoria'].isin(categorias_selecionadas)].copy()
     df_exibicao['Total Item (R$)'] = df_exibicao['Quantidade'] * df_exibicao['Preço Unitário (R$)']
     
-    # Salva o DataFrame filtrado no estado para ser usado no cálculo do salvamento automático
     st.session_state.df_atual_exibicao = df_exibicao
 
-    # Renderiza a tabela vinculada com a função automática 'on_change'
     st.data_editor(
         df_exibicao,
         hide_index=True,
         use_container_width=True,
         num_rows="dynamic",
         key="tabela_compras",
-        on_change=salvar_mudancas_automatico, # CHAMA A FUNÇÃO AUTOMATICAMENTE A CADA CLIQUE/DIGITAÇÃO
+        on_change=salvar_mudancas_automatico,
         column_config={
             "id_original": None,
             "Pego (Carrinho)": st.column_config.CheckboxColumn(),
@@ -229,8 +284,7 @@ if dados_mes["itens"]:
         use_container_width=True
     )
 
-# --- AUTO-REFRESH DE LEITURA (A CADA 2 SEGUNDOS) ---
-# Atualiza os dados na sua tela caso OUTRA pessoa mude algo no mercado
+# --- AUTO-REFRESH DE LEITURA (2 SEGUNDOS) ---
 time.sleep(2)
 dados_nuvem = carregar_historico_nuvem()
 if dados_nuvem and dados_nuvem != st.session_state.historico:
