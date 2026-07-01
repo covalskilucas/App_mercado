@@ -18,10 +18,10 @@ st.set_page_config(page_title="Gerenciador de Compras", page_icon="🛒", layout
 
 URL_BASE_FIREBASE = "https://app-compras-mercado-default-rtdb.firebaseio.com/"
 
-# CONFIGURAÇÃO DO GEMINI (Substitua pela sua chave ou configure nos Secrets do Streamlit)
+# CONFIGURAÇÃO DO GEMINI (AQ.Ab8RN6I24otIO7YwR7spLRTrdREFvunXyTcDuNRZego57L8O8g)
 # Dica: Na produção, use st.secrets["GEMINI_API_KEY"]
-GEMINI_API_KEY = "SUA_CHAVE_API_DO_GEMINI_AQUI" 
-if GEMINI_API_KEY != "SUA_CHAVE_API_DO_GEMINI_AQUI":
+GEMINI_API_KEY = "AQ.Ab8RN6I24otIO7YwR7spLRTrdREFvunXyTcDuNRZego57L8O8g" 
+if GEMINI_API_KEY != "AQ.Ab8RN6I24otIO7YwR7spLRTrdREFvunXyTcDuNRZego57L8O8g":
     genai.configure(api_key=GEMINI_API_KEY)
 
 CATEGORIAS = ["Mercearia", "Hortifrúti", "Açougue", "Laticínios / Frios", "Limpeza", "Higiene", "Bebidas", "Padaria", "Outros"]
